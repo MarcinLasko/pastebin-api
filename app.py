@@ -91,12 +91,17 @@ def search_google(query):
     
     return results
 
-def search_pastebin_direct(query):
+def search_pastebin_direct(query, max_content_checks=10):
     """
-    Przeszukuje bezpośrednio archiwum Pastebin i PUBLIC PASTES
+    Przeszukuje archiwum - balansuje między szybkością a dokładnością
+    
+    Args:
+        query: szukana fraza
+        max_content_checks: ile paste'ów max pobrać (dla szybkości)
     """
     results = []
-    found_ids = set()  # Aby uniknąć duplikatów
+    found_ids = set()
+    content_checks = 0
     
     try:
         archive_url = "https://pastebin.com/archive"
@@ -105,89 +110,83 @@ def search_pastebin_direct(query):
         
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 1. Przeszukaj główną tabelę archiwum
+        # Znajdź wszystkie linki do paste'ów
+        all_paste_links = []
+        
+        # Główna tabela archiwum
         table = soup.find('table', class_='maintable')
         if table:
-            rows = table.find_all('tr')[1:]  # Pomijamy nagłówek
-            
-            for row in rows[:20]:  # Sprawdzamy pierwsze 20 wpisów
-                cells = row.find_all('td')
-                if len(cells) >= 2:
-                    link_elem = cells[0].find('a')
-                    if link_elem:
-                        paste_id = link_elem['href'].strip('/')
-                        title = link_elem.text.strip()
+            for row in table.find_all('tr')[1:]:
+                link = row.find('a', href=True)
+                if link:
+                    all_paste_links.append({
+                        'id': link['href'].strip('/'),
+                        'title': link.text.strip()
+                    })
+        
+        # Sidebar
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            if href.startswith('/') and len(href) == 9 and href[1:].isalnum():
+                paste_id = href.strip('/')
+                if paste_id not in found_ids:
+                    all_paste_links.append({
+                        'id': paste_id,
+                        'title': link.text.strip()
+                    })
+        
+        logging.info(f"Znaleziono {len(all_paste_links)} paste'ów")
+        
+        # FAZA 1: Najpierw sprawdź wszystkie tytuły (szybkie)
+        for paste in all_paste_links:
+            if query.lower() in paste['title'].lower():
+                found_ids.add(paste['id'])
+                results.append({
+                    'link': f"https://pastebin.com/{paste['id']}",
+                    'snippet': f"[W tytule] {paste['title']}",
+                    'paste_id': paste['id']
+                })
+        
+        # FAZA 2: Sprawdź zawartość paste'ów z tytułem "Untitled" (wolniejsze)
+        untitled_pastes = [p for p in all_paste_links 
+                          if p['id'] not in found_ids 
+                          and ('untitled' in p['title'].lower() or p['title'] == '')]
+        
+        for paste in untitled_pastes[:max_content_checks]:
+            try:
+                raw_url = f"https://pastebin.com/raw/{paste['id']}"
+                raw_response = requests.get(raw_url, headers=HEADERS, timeout=2)
+                
+                if raw_response.status_code == 200:
+                    content = raw_response.text[:2000]
+                    
+                    if query.lower() in content.lower():
+                        # Znajdź fragment
+                        idx = content.lower().find(query.lower())
+                        start = max(0, idx - 80)
+                        end = min(len(content), idx + 120)
+                        snippet = content[start:end].replace('\n', ' ').strip()
+                        if start > 0:
+                            snippet = "..." + snippet
+                        if end < len(content):
+                            snippet = snippet + "..."
                         
-                        # Sprawdzamy tytuł lub pobieramy zawartość
-                        if query.lower() in title.lower() or title.lower() == "untitled":
-                            # Pobierz zawartość paste
-                            try:
-                                raw_url = f"https://pastebin.com/raw/{paste_id}"
-                                raw_response = requests.get(raw_url, headers=HEADERS, timeout=3)
-                                content = raw_response.text[:1000]  # Pierwsze 1000 znaków
-                                
-                                if query.lower() in content.lower():
-                                    # Znajdź fragment z szukaną frazą
-                                    idx = content.lower().find(query.lower())
-                                    start = max(0, idx - 50)
-                                    end = min(len(content), idx + 150)
-                                    snippet = "..." + content[start:end].replace('\n', ' ') + "..."
-                                    
-                                    if paste_id not in found_ids:
-                                        found_ids.add(paste_id)
-                                        results.append({
-                                            'link': f"https://pastebin.com/{paste_id}",
-                                            'snippet': snippet,
-                                            'paste_id': paste_id
-                                        })
-                            except:
-                                # Jeśli nie można pobrać, użyj tytułu
-                                if query.lower() in title.lower() and paste_id not in found_ids:
-                                    found_ids.add(paste_id)
-                                    results.append({
-                                        'link': f"https://pastebin.com/{paste_id}",
-                                        'snippet': title,
-                                        'paste_id': paste_id
-                                    })
+                        found_ids.add(paste['id'])
+                        results.append({
+                            'link': f"https://pastebin.com/{paste['id']}",
+                            'snippet': snippet,
+                            'paste_id': paste['id']
+                        })
+                    
+                    content_checks += 1
+                    
+            except Exception as e:
+                logging.debug(f"Nie można pobrać {paste['id']}: {e}")
         
-        # 2. Przeszukaj sekcję "Public Pastes" (po prawej stronie)
-        public_section = soup.find('div', class_='sidebar__title', string='Public Pastes')
-        if public_section:
-            # Znajdź kontener z publicznymi paste
-            sidebar = public_section.find_parent('div')
-            if sidebar:
-                # Szukaj wszystkich linków w tej sekcji
-                for item in sidebar.find_all('li'):
-                    link = item.find('a')
-                    if link and 'href' in link.attrs:
-                        paste_id = link['href'].strip('/')
-                        if len(paste_id) == 8 and paste_id not in found_ids:
-                            # Pobierz tytuł i inne info
-                            title_text = link.text.strip()
-                            
-                            # Sprawdź czy warto pobrać zawartość
-                            if query.lower() in title_text.lower() or "untitled" in title_text.lower():
-                                try:
-                                    raw_url = f"https://pastebin.com/raw/{paste_id}"
-                                    raw_response = requests.get(raw_url, headers=HEADERS, timeout=3)
-                                    content = raw_response.text[:1000]
-                                    
-                                    if query.lower() in content.lower():
-                                        idx = content.lower().find(query.lower())
-                                        start = max(0, idx - 50)
-                                        end = min(len(content), idx + 150)
-                                        snippet = "..." + content[start:end].replace('\n', ' ') + "..."
-                                        
-                                        found_ids.add(paste_id)
-                                        results.append({
-                                            'link': f"https://pastebin.com/{paste_id}",
-                                            'snippet': snippet,
-                                            'paste_id': paste_id
-                                        })
-                                except:
-                                    pass
+        # Sortuj - tytuły najpierw, potem zawartość
+        results.sort(key=lambda x: 0 if '[W tytule]' in x['snippet'] else 1)
         
-        logging.info(f"Archiwum + Public Pastes: znaleziono {len(results)} wyników")
+        logging.info(f"Znaleziono {len(results)} wyników (sprawdzono {content_checks} zawartości)")
         
     except Exception as e:
         logging.error(f"Błąd archiwum: {str(e)}")
@@ -239,22 +238,62 @@ def search_duckduckgo(query):
     
     return results
 
+def enrich_with_content(results, query, max_fetch=5):
+    """
+    Wzbogaca wyniki o rzeczywistą zawartość
+    """
+    enriched = []
+    fetched = 0
+    
+    for result in results:
+        # Jeśli snippet wygląda na domyślny, pobierz zawartość
+        if "Pastebin.com is the number one" in result['snippet'] and fetched < max_fetch:
+            try:
+                raw_url = f"https://pastebin.com/raw/{result['paste_id']}"
+                response = requests.get(raw_url, headers=HEADERS, timeout=3)
+                if response.status_code == 200:
+                    content = response.text[:2000]
+                    
+                    # Znajdź fragment z query
+                    idx = content.lower().find(query.lower())
+                    if idx != -1:
+                        start = max(0, idx - 80)
+                        end = min(len(content), idx + 120)
+                        snippet = content[start:end].replace('\n', ' ').strip()
+                        if start > 0:
+                            snippet = "..." + snippet
+                        if end < len(content):
+                            snippet = snippet + "..."
+                        
+                        result['snippet'] = snippet
+                        enriched.append(result)
+                    fetched += 1
+            except Exception as e:
+                logging.debug(f"Nie można pobrać {result['paste_id']}: {e}")
+        else:
+            enriched.append(result)
+    
+    return enriched
+
 def perform_search(query):
     """
-    Główna funkcja wyszukiwania - próbuje różnych metod
+    Główna funkcja wyszukiwania - priorytet na archiwum
     """
-    # Najpierw próbuj Google
-    results = search_google(query)
+    # Zaczynamy od archiwum (najbardziej niezawodne)
+    logging.info("Przeszukuję archiwum Pastebin...")
+    results = search_pastebin_direct(query)
     
-    # Jeśli brak wyników, próbuj DuckDuckGo
-    if not results:
-        logging.info("Próbuję DuckDuckGo...")
-        results = search_duckduckgo(query)
-    
-    # Jeśli nadal brak, przeszukaj archiwum
-    if not results:
-        logging.info("Próbuję archiwum...")
-        results = search_pastebin_direct(query)
+    # Jeśli mało wyników, spróbuj innych metod
+    if len(results) < 5:
+        # Próbuj DuckDuckGo (Google jest zbyt restrykcyjne)
+        logging.info("Uzupełniam wyniki z DuckDuckGo...")
+        ddg_results = search_duckduckgo(query)
+        
+        # Dodaj unikalne wyniki
+        existing_ids = {r['paste_id'] for r in results}
+        for r in ddg_results:
+            if r['paste_id'] not in existing_ids:
+                results.append(r)
     
     return results
 
@@ -262,8 +301,16 @@ def perform_search(query):
 def search():
     """
     Endpoint API do wyszukiwania
+    
+    Parametry:
+        q: szukana fraza (wymagane)
+        mode: tryb wyszukiwania (opcjonalne)
+            - 'balanced' (domyślny): sprawdza tytuły + 10 zawartości
+            - 'fast': tylko tytuły (bardzo szybkie)
+            - 'deep': sprawdza tytuły + 20 zawartości (wolniejsze)
     """
     query = request.args.get('q', '').strip()
+    mode = request.args.get('mode', 'balanced')
     
     if not query:
         return jsonify({
@@ -271,15 +318,26 @@ def search():
             'results': []
         }), 400
     
-    logging.info(f"Otrzymano zapytanie: {query}")
+    logging.info(f"Otrzymano zapytanie: {query} (tryb: {mode})")
+    
+    # Ustaw limit sprawdzania zawartości w zależności od trybu
+    content_limit = {
+        'fast': 0,      # Tylko tytuły
+        'balanced': 10, # Domyślnie 10 paste'ów
+        'deep': 20      # Maksymalnie 20 paste'ów
+    }.get(mode, 10)
     
     # Używamy cache
     cache_time = int(time.time() // 300)
-    results = cached_search(query, cache_time)
+    cache_key = f"{query}:{mode}:{cache_time}"
+    
+    # Modyfikuj funkcję perform_search aby przekazać limit
+    results = search_pastebin_direct(query, max_content_checks=content_limit)
     
     # Formatowanie odpowiedzi
     response_data = {
         'query': query,
+        'mode': mode,
         'count': len(results),
         'results': results
     }
@@ -365,4 +423,5 @@ def index():
     })
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    # Dla developmentu lokalnego
+    app.run(host='127.0.0.1', port=5000, debug=True)
