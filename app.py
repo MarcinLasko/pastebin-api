@@ -28,6 +28,7 @@ def search_google(query):
     Wyszukiwanie przez Google
     """
     results = []
+    found_ids = set()  # Dodajemy kontrolę duplikatów też tutaj
     
     search_url = "https://www.google.com/search"
     search_query = f"site:pastebin.com {query}"
@@ -54,37 +55,39 @@ def search_google(query):
                 link = link_elem['href']
                 
                 if 'pastebin.com' in link and '/raw/' not in link and '/u/' not in link:
-                    snippet = ""
-                    
-                    # Szukamy snippetu
-                    snippet_selectors = [
-                        ('span', {'class': 'aCOpRe'}),
-                        ('div', {'class': 'IsZvec'}),
-                        ('div', {'class': 'VwiC3b'}),
-                        ('span', {'class': 'st'})
-                    ]
-                    
-                    for tag, attrs in snippet_selectors:
-                        snippet_elem = g.find(tag, attrs)
-                        if snippet_elem:
-                            snippet = snippet_elem.get_text(strip=True)
-                            break
-                    
-                    if not snippet:
-                        title_elem = g.find('h3')
-                        if title_elem:
-                            snippet = title_elem.get_text(strip=True)
-                    
                     paste_id = link.split('/')[-1].split('?')[0]
                     
-                    if paste_id and len(paste_id) == 8:
+                    # WAŻNE: Sprawdź czy już nie mamy tego ID
+                    if paste_id and len(paste_id) == 8 and paste_id not in found_ids:
+                        snippet = ""
+                        
+                        # Szukamy snippetu
+                        snippet_selectors = [
+                            ('span', {'class': 'aCOpRe'}),
+                            ('div', {'class': 'IsZvec'}),
+                            ('div', {'class': 'VwiC3b'}),
+                            ('span', {'class': 'st'})
+                        ]
+                        
+                        for tag, attrs in snippet_selectors:
+                            snippet_elem = g.find(tag, attrs)
+                            if snippet_elem:
+                                snippet = snippet_elem.get_text(strip=True)
+                                break
+                        
+                        if not snippet:
+                            title_elem = g.find('h3')
+                            if title_elem:
+                                snippet = title_elem.get_text(strip=True)
+                        
+                        found_ids.add(paste_id)  # Oznacz jako znalezione
                         results.append({
                             'link': link,
                             'snippet': snippet[:200] + '...' if len(snippet) > 200 else snippet,
                             'paste_id': paste_id
                         })
         
-        logging.info(f"Google znalazło {len(results)} wyników")
+        logging.info(f"Google znalazło {len(results)} unikalnych wyników")
         
     except Exception as e:
         logging.error(f"Błąd Google: {str(e)}")
@@ -93,7 +96,7 @@ def search_google(query):
 
 def search_pastebin_direct(query, max_content_checks=10):
     """
-    Przeszukuje archiwum - balansuje między szybkością a dokładnością
+    Przeszukuje archiwum - zawsze sprawdza zawartość
     
     Args:
         query: szukana fraza
@@ -119,10 +122,13 @@ def search_pastebin_direct(query, max_content_checks=10):
             for row in table.find_all('tr')[1:]:
                 link = row.find('a', href=True)
                 if link:
-                    all_paste_links.append({
-                        'id': link['href'].strip('/'),
-                        'title': link.text.strip()
-                    })
+                    paste_id = link['href'].strip('/')
+                    if paste_id not in found_ids:
+                        all_paste_links.append({
+                            'id': paste_id,
+                            'title': link.text.strip()
+                        })
+                        found_ids.add(paste_id)
         
         # Sidebar
         for link in soup.find_all('a', href=True):
@@ -134,59 +140,64 @@ def search_pastebin_direct(query, max_content_checks=10):
                         'id': paste_id,
                         'title': link.text.strip()
                     })
+                    found_ids.add(paste_id)
         
-        logging.info(f"Znaleziono {len(all_paste_links)} paste'ów")
+        logging.info(f"Znaleziono {len(all_paste_links)} paste'ów do sprawdzenia")
         
-        # FAZA 1: Najpierw sprawdź wszystkie tytuły (szybkie)
-        for paste in all_paste_links:
-            if query.lower() in paste['title'].lower():
-                found_ids.add(paste['id'])
-                results.append({
-                    'link': f"https://pastebin.com/{paste['id']}",
-                    'snippet': f"[W tytule] {paste['title']}",
-                    'paste_id': paste['id']
-                })
+        # Resetuj found_ids dla właściwego wyszukiwania
+        found_ids = set()
         
-        # FAZA 2: Sprawdź zawartość paste'ów z tytułem "Untitled" (wolniejsze)
-        untitled_pastes = [p for p in all_paste_links 
-                          if p['id'] not in found_ids 
-                          and ('untitled' in p['title'].lower() or p['title'] == '')]
-        
-        for paste in untitled_pastes[:max_content_checks]:
+        # Sprawdzaj zawartość WSZYSTKICH paste'ów (do limitu)
+        for paste in all_paste_links[:max_content_checks]:
             try:
                 raw_url = f"https://pastebin.com/raw/{paste['id']}"
-                raw_response = requests.get(raw_url, headers=HEADERS, timeout=2)
+                raw_response = requests.get(raw_url, headers=HEADERS, timeout=3)
                 
                 if raw_response.status_code == 200:
-                    content = raw_response.text[:2000]
+                    content = raw_response.text[:5000]  # Sprawdzamy więcej tekstu
                     
                     if query.lower() in content.lower():
-                        # Znajdź fragment
-                        idx = content.lower().find(query.lower())
-                        start = max(0, idx - 80)
-                        end = min(len(content), idx + 120)
-                        snippet = content[start:end].replace('\n', ' ').strip()
+                        # Znajdź najlepszy fragment
+                        content_lower = content.lower()
+                        idx = content_lower.find(query.lower())
+                        
+                        # Pokaż więcej kontekstu
+                        start = max(0, idx - 100)
+                        end = min(len(content), idx + 150)
+                        snippet = content[start:end].replace('\n', ' ').replace('\r', '').strip()
+                        
+                        # Dodaj elipsy
                         if start > 0:
                             snippet = "..." + snippet
                         if end < len(content):
                             snippet = snippet + "..."
                         
-                        found_ids.add(paste['id'])
                         results.append({
                             'link': f"https://pastebin.com/{paste['id']}",
                             'snippet': snippet,
-                            'paste_id': paste['id']
+                            'paste_id': paste['id'],
+                            'title': paste['title']  # Dodajemy też tytuł dla kontekstu
                         })
+                        
+                        logging.debug(f"Znaleziono '{query}' w paste {paste['id']}")
                     
-                    content_checks += 1
+                content_checks += 1
                     
             except Exception as e:
                 logging.debug(f"Nie można pobrać {paste['id']}: {e}")
         
-        # Sortuj - tytuły najpierw, potem zawartość
-        results.sort(key=lambda x: 0 if '[W tytule]' in x['snippet'] else 1)
+        # Jeśli sprawdziliśmy limit ale są jeszcze paste'y, sprawdź przynajmniej tytuły pozostałych
+        if content_checks >= max_content_checks:
+            for paste in all_paste_links[max_content_checks:]:
+                if query.lower() in paste['title'].lower():
+                    results.append({
+                        'link': f"https://pastebin.com/{paste['id']}",
+                        'snippet': f"[Tylko tytul - nie sprawdzono zawartosci] {paste['title']}",
+                        'paste_id': paste['id'],
+                        'title': paste['title']
+                    })
         
-        logging.info(f"Znaleziono {len(results)} wyników (sprawdzono {content_checks} zawartości)")
+        logging.info(f"Znaleziono {len(results)} wyników (sprawdzono zawartość {content_checks} paste'ów)")
         
     except Exception as e:
         logging.error(f"Błąd archiwum: {str(e)}")
@@ -198,6 +209,7 @@ def search_duckduckgo(query):
     Wyszukiwanie przez DuckDuckGo
     """
     results = []
+    found_ids = set()  # Kontrola duplikatów
     
     try:
         search_url = "https://html.duckduckgo.com/html/"
@@ -224,14 +236,16 @@ def search_duckduckgo(query):
                 
                 snippet = snippet_elem.text if snippet_elem else link_elem.text
                 
-                if paste_id and len(paste_id) == 8:
+                # Sprawdź duplikaty
+                if paste_id and len(paste_id) == 8 and paste_id not in found_ids:
+                    found_ids.add(paste_id)
                     results.append({
                         'link': link,
                         'snippet': snippet[:200] + '...' if len(snippet) > 200 else snippet,
                         'paste_id': paste_id
                     })
         
-        logging.info(f"DuckDuckGo znalazło {len(results)} wyników")
+        logging.info(f"DuckDuckGo znalazło {len(results)} unikalnych wyników")
         
     except Exception as e:
         logging.error(f"Błąd DuckDuckGo: {str(e)}")
@@ -279,38 +293,52 @@ def perform_search(query):
     """
     Główna funkcja wyszukiwania - priorytet na archiwum
     """
-    # Zaczynamy od archiwum (najbardziej niezawodne)
+    all_results = []
+    seen_ids = set()
+    
+    # 1. Zaczynamy od archiwum (najbardziej niezawodne)
     logging.info("Przeszukuję archiwum Pastebin...")
-    results = search_pastebin_direct(query)
+    archive_results = search_pastebin_direct(query)
     
-    # Jeśli mało wyników, spróbuj innych metod
-    if len(results) < 5:
-        # Próbuj DuckDuckGo (Google jest zbyt restrykcyjne)
-        logging.info("Uzupełniam wyniki z DuckDuckGo...")
-        ddg_results = search_duckduckgo(query)
+    # Dodaj tylko unikalne
+    for r in archive_results:
+        if r['paste_id'] not in seen_ids:
+            seen_ids.add(r['paste_id'])
+            all_results.append(r)
+    
+    # 2. Jeśli mało wyników, spróbuj innych metod
+    if len(all_results) < 5:
+        # Próbuj Google
+        logging.info("Uzupełniam wyniki z Google...")
+        google_results = search_google(query)
         
-        # Dodaj unikalne wyniki
-        existing_ids = {r['paste_id'] for r in results}
-        for r in ddg_results:
-            if r['paste_id'] not in existing_ids:
-                results.append(r)
+        for r in google_results:
+            if r['paste_id'] not in seen_ids:
+                seen_ids.add(r['paste_id'])
+                all_results.append(r)
+        
+        # Jeśli nadal mało, próbuj DuckDuckGo
+        if len(all_results) < 5:
+            logging.info("Uzupełniam wyniki z DuckDuckGo...")
+            ddg_results = search_duckduckgo(query)
+            
+            for r in ddg_results:
+                if r['paste_id'] not in seen_ids:
+                    seen_ids.add(r['paste_id'])
+                    all_results.append(r)
     
-    return results
+    # 3. Wzbogać wyniki z domyślnymi snippetami
+    enriched_results = enrich_with_content(all_results, query)
+    
+    logging.info(f"Zwracam {len(enriched_results)} unikalnych wyników")
+    return enriched_results
 
 @app.route('/search', methods=['GET'])
 def search():
     """
     Endpoint API do wyszukiwania
-    
-    Parametry:
-        q: szukana fraza (wymagane)
-        mode: tryb wyszukiwania (opcjonalne)
-            - 'balanced' (domyślny): sprawdza tytuły + 10 zawartości
-            - 'fast': tylko tytuły (bardzo szybkie)
-            - 'deep': sprawdza tytuły + 20 zawartości (wolniejsze)
     """
     query = request.args.get('q', '').strip()
-    mode = request.args.get('mode', 'balanced')
     
     if not query:
         return jsonify({
@@ -318,28 +346,26 @@ def search():
             'results': []
         }), 400
     
-    logging.info(f"Otrzymano zapytanie: {query} (tryb: {mode})")
-    
-    # Ustaw limit sprawdzania zawartości w zależności od trybu
-    content_limit = {
-        'fast': 0,      # Tylko tytuły
-        'balanced': 10, # Domyślnie 10 paste'ów
-        'deep': 20      # Maksymalnie 20 paste'ów
-    }.get(mode, 10)
+    logging.info(f"Otrzymano zapytanie: {query}")
     
     # Używamy cache
     cache_time = int(time.time() // 300)
-    cache_key = f"{query}:{mode}:{cache_time}"
+    results = cached_search(query, cache_time)
     
-    # Modyfikuj funkcję perform_search aby przekazać limit
-    results = search_pastebin_direct(query, max_content_checks=content_limit)
+    # Dodatowa deduplicacja na wszelki wypadek
+    unique_results = []
+    seen_ids = set()
+    
+    for r in results:
+        if r['paste_id'] not in seen_ids:
+            seen_ids.add(r['paste_id'])
+            unique_results.append(r)
     
     # Formatowanie odpowiedzi
     response_data = {
         'query': query,
-        'mode': mode,
-        'count': len(results),
-        'results': results
+        'count': len(unique_results),
+        'results': unique_results
     }
     
     return jsonify(response_data)
@@ -424,4 +450,4 @@ def index():
 
 if __name__ == '__main__':
     # Dla developmentu lokalnego
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='127.0.0.1', port=5000, debug=True)
